@@ -1,0 +1,79 @@
+version: "3.8"
+
+services:
+  # Service acting as the receiver and decompressor
+  receiver:
+    # image: python:3.9-slim
+    build:
+      dockerfile_inline: |
+        FROM python:3.9-slim
+        RUN python -m pip install requests
+    ports:
+      - "8081:8081"
+    volumes:
+      - ./:/app
+    command: |
+      python -c "
+      import http.server
+      import socketserver
+      import gzip
+      import requests
+
+      class GzipHandler(http.server.BaseHTTPRequestHandler):
+          def do_POST(self):
+              content_length = int(self.headers.get('Content-Length', 0))
+              compressed_data = self.rfile.read(content_length)
+              
+              if self.headers.get('Content-Encoding') == 'gzip':
+                  decompressed_data = gzip.decompress(compressed_data)
+              else:
+                  decompressed_data = compressed_data
+
+              # Forward decompressed data to backend service
+              response = requests.post('http://backend:8082', data=decompressed_data)
+              self.send_response(200)
+              self.send_header('Content-Type', 'text/plain')
+              self.end_headers()
+              self.wfile.write(response.content)
+
+
+      # Start the server
+      PORT = 8081
+      with socketserver.TCPServer(('', PORT), GzipHandler) as httpd:
+          print('Server started at port', PORT)
+          httpd.serve_forever()
+      "
+    networks:
+      - app-network
+
+  # Service acting as the backend (final destination)
+  backend:
+    image: python:3.9-slim
+    ports:
+      - "8082:8082"
+    command: |
+      python -c "import http.server
+      import http.server
+      import socketserver
+
+      class BackendHandler(http.server.BaseHTTPRequestHandler):
+          def do_POST(self):
+              content_length = int(self.headers.get('Content-Length', 0))
+              data = self.rfile.read(content_length)
+              self.send_response(200)
+              self.send_header('Content-Type', 'text/plain')
+              self.end_headers()
+              self.wfile.write(b'Received decompressed data: ' + data)
+
+      # Start the server
+      PORT = 8082
+      with socketserver.TCPServer(('', PORT), BackendHandler) as httpd:
+          print('Backend started at port', PORT)
+          httpd.serve_forever()
+      "
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge
