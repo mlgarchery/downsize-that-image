@@ -1,0 +1,132 @@
+services:
+  receiver:
+    build:
+      dockerfile_inline: |
+        FROM golang:1.21-alpine AS builder
+        WORKDIR /app
+
+        # Create Go file using a heredoc
+        RUN cat <<EOF > receiver.go
+        package main
+
+        import (
+            "bytes"
+            "compress/gzip"
+            "io"
+            "log"
+            "net/http"
+        )
+
+        func main() {
+            http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+                if r.Method != http.MethodPost {
+                    http.Error(w, "Only POST method is supported", http.StatusMethodNotAllowed)
+                    return
+                }
+
+                var requestBody []byte
+                var err error
+
+                // Check if the request is gzip compressed
+                if r.Header.Get("Content-Encoding") == "gzip" {
+                    // Create a gzip reader
+                    gzipReader, err := gzip.NewReader(r.Body)
+                    if err != nil {
+                        http.Error(w, "Failed to read gzip data: "+err.Error(), http.StatusBadRequest)
+                        return
+                    }
+                    defer gzipReader.Close()
+
+                    // Read decompressed data
+                    requestBody, err = io.ReadAll(gzipReader)
+                    if err != nil {
+                        http.Error(w, "Failed to decompress data: "+err.Error(), http.StatusInternalServerError)
+                        return
+                    }
+                } else {
+                    // Read uncompressed data directly
+                    requestBody, err = io.ReadAll(r.Body)
+                    if err != nil {
+                        http.Error(w, "Failed to read request body: "+err.Error(), http.StatusInternalServerError)
+                        return
+                    }
+                }
+
+                // Forward decompressed data to backend
+                resp, err := http.Post("http://backend:8080", "application/octet-stream", bytes.NewReader(requestBody))
+                if err != nil {
+                    http.Error(w, "Failed to forward to backend: "+err.Error(), http.StatusInternalServerError)
+                    return
+                }
+                defer resp.Body.Close()
+
+                // Read backend response
+                responseBody, err := io.ReadAll(resp.Body)
+                if err != nil {
+                    http.Error(w, "Failed to read backend response: "+err.Error(), http.StatusInternalServerError)
+                    return
+                }
+
+                // Copy status code and headers from backend response
+                w.WriteHeader(resp.StatusCode)
+                for key, values := range resp.Header {
+                    for _, value := range values {
+                        w.Header().Add(key, value)
+                    }
+                }
+
+                // Write backend response to client
+                w.Write(responseBody)
+            })
+
+            log.Println("Server started at port 8081")
+            if err := http.ListenAndServe(":8081", nil); err != nil {
+                log.Fatalf("Server failed: %v", err)
+            }
+        }
+        EOF
+
+        RUN CGO_ENABLED=0 GOOS=linux go build -ldflags '-s -w' -o receiver receiver.go \
+          && apk add --no-cache upx \
+          && upx --best receiver
+
+        # Final stage with just the binary
+        FROM scratch
+        COPY --from=builder /app/receiver /receiver
+        EXPOSE 8081
+        ENTRYPOINT ["/receiver"]
+    ports:
+      - "8081:8081"
+    networks:
+      - app-network
+
+  # Service acting as the backend (final destination)
+  backend:
+    image: python:3.9-slim
+    ports:
+      - "8080:8080"
+    command: |
+      python3 -c "
+      import http.server
+      import socketserver
+
+      class BackendHandler(http.server.BaseHTTPRequestHandler):
+          def do_POST(self):
+              content_length = int(self.headers.get('Content-Length', 0))
+              data = self.rfile.read(content_length)
+              self.send_response(200)
+              self.send_header('Content-Type', 'text/plain')
+              self.end_headers()
+              self.wfile.write(b'Received decompressed data: ' + data)
+
+      # Start the server
+      PORT = 8080
+      with socketserver.TCPServer(('', PORT), BackendHandler) as httpd:
+          print('Backend started at port', PORT)
+          httpd.serve_forever()
+      "
+    networks:
+      - app-network
+
+networks:
+  app-network:
