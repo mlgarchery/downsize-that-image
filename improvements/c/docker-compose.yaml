@@ -1,0 +1,211 @@
+services:
+  receiver:
+    container_name: decompressor-c
+    build:
+      dockerfile_inline: |
+        # ───────────────────────────── 1. build stage ─────────────────────────────
+        FROM alpine:3.20 AS builder
+
+        # Only what we absolutely need: a compiler and zlib headers
+        RUN apk add --no-cache build-base zlib-dev zlib-static
+
+        WORKDIR /app
+
+        # ----------------------- tiny HTTP proxy in C ----------------------------
+        RUN cat <<'EOF' > receiver.c
+        #define _GNU_SOURCE
+        #include <arpa/inet.h>
+        #include <errno.h>
+        #include <netdb.h>
+        #include <netinet/in.h>
+        #include <stdio.h>
+        #include <stdlib.h>
+        #include <string.h>
+        #include <strings.h>
+        #include <sys/socket.h>
+        #include <unistd.h>
+        #include <zlib.h>
+
+        #define LISTEN_PORT 8081
+        #define BACKEND_HOST "backend"
+        #define BACKEND_PORT "8080"
+        #define BUF 8192
+
+        static ssize_t read_all(int fd, void *buf, size_t len) {
+            size_t n = 0;
+            while (n < len) {
+                ssize_t r = read(fd, (char *)buf + n, len - n);
+                if (r <= 0) return r;
+                n += r;
+            }
+            return n;
+        }
+
+        static int send_all(int fd, const void *buf, size_t len) {
+            size_t n = 0;
+            while (n < len) {
+                ssize_t w = write(fd, (const char *)buf + n, len - n);
+                if (w <= 0) return -1;
+                n += w;
+            }
+            return 0;
+        }
+
+        /* Minimal gunzip helper --------------------------------------------------*/
+        static unsigned char *gunzip(const unsigned char *in, size_t inlen,
+                                     size_t *outlen) {
+            size_t cap = inlen * 3 + 1024;
+            unsigned char *out = malloc(cap);
+            if (!out) return NULL;
+
+            z_stream s = {0};
+            s.next_in = (unsigned char *)in;
+            s.avail_in = inlen;
+            if (inflateInit2(&s, 16 + MAX_WBITS) != Z_OK) { free(out); return NULL; }
+
+            s.next_out  = out;
+            s.avail_out = cap;
+            while (1) {
+                int rc = inflate(&s, Z_NO_FLUSH);
+                if (rc == Z_STREAM_END) break;
+                if (rc != Z_OK)                     { inflateEnd(&s); free(out); return NULL; }
+                if (s.avail_out == 0) {             /* grow buffer */
+                    cap *= 2;
+                    out = realloc(out, cap);
+                    if (!out)                       { inflateEnd(&s); return NULL; }
+                    s.next_out  = out + s.total_out;
+                    s.avail_out = cap - s.total_out;
+                }
+            }
+            *outlen = s.total_out;
+            inflateEnd(&s);
+            return out;
+        }
+
+        /* Connect to backend -----------------------------------------------------*/
+        static int connect_backend(void) {
+            struct addrinfo h = {0}, *res;
+            h.ai_family   = AF_INET;
+            h.ai_socktype = SOCK_STREAM;
+            if (getaddrinfo(BACKEND_HOST, BACKEND_PORT, &h, &res)) return -1;
+            int s = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+            if (s < 0 || connect(s, res->ai_addr, res->ai_addrlen)) { if (s>=0) close(s); freeaddrinfo(res); return -1; }
+            freeaddrinfo(res);
+            return s;
+        }
+
+        int main(void) {
+            int srv = socket(AF_INET, SOCK_STREAM, 0);
+            int opt = 1;
+            setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+            struct sockaddr_in a = { .sin_family = AF_INET,
+                                     .sin_addr.s_addr = INADDR_ANY,
+                                     .sin_port = htons(LISTEN_PORT) };
+            if (bind(srv, (struct sockaddr *)&a, sizeof a) || listen(srv, 16)) {
+                perror("bind/listen");  return 1;
+            }
+            fprintf(stderr, "receiver listening on %d\n", LISTEN_PORT);
+
+            while (1) {
+                int c = accept(srv, NULL, NULL);
+                if (c < 0) continue;
+
+                /* Grab headers ---------------------------------------------------*/
+                char peek[BUF];
+                ssize_t n = recv(c, peek, sizeof peek - 1, MSG_PEEK);
+                if (n <= 0) { close(c); continue; }
+                peek[n] = 0;
+                char *end = strstr(peek, "\r\n\r\n");
+                if (!end)   { close(c); continue; }
+                size_t hlen = end - peek + 4;
+
+                char *hdr = malloc(hlen + 1);
+                read_all(c, hdr, hlen); hdr[hlen] = 0;
+
+                /* Content-Length --------------------------------------------------*/
+                size_t clen = 0;
+                char *clp = strcasestr(hdr, "Content-Length:");
+                if (clp) clen = strtoul(clp + 15, NULL, 10);
+
+                int gzip = 0;
+                char *cep = strcasestr(hdr, "Content-Encoding:");
+                if (cep && strcasestr(cep, "gzip")) gzip = 1;
+
+                unsigned char *body = malloc(clen);
+                if (read_all(c, body, clen) != (ssize_t)clen) { free(body); free(hdr); close(c); continue; }
+
+                unsigned char *data = body;
+                size_t dlen = clen;
+                if (gzip) {                          /* decompress if needed       */
+                    data = gunzip(body, clen, &dlen);
+                    free(body);
+                    if (!data) { free(hdr); close(c); continue; }
+                }
+
+                /* Forward --------------------------------------------------------*/
+                int b = connect_backend();
+                if (b >= 0) {
+                    char req[128];
+                    int  rl = snprintf(req, sizeof req, "POST / HTTP/1.0\r\nContent-Length: %zu\r\n\r\n", dlen);
+                    send_all(b, req, rl);
+                    send_all(b, data, dlen);
+
+                    /* Pipe entire backend reply to client ------------------------*/
+                    char resp[BUF];
+                    ssize_t r;
+                    while ((r = recv(b, resp, sizeof resp, 0)) > 0) {
+                        if (send_all(c, resp, r) < 0) break;
+                    }
+                    close(b);
+                }
+
+                free(data); free(hdr); close(c);
+            }
+        }
+        EOF
+
+        # Static, stripped, size-optimized build
+        RUN gcc -static -Os -s receiver.c -o receiver -lz
+
+        # ───────────────────────────── 2. final stage ─────────────────────────────
+        FROM scratch
+        COPY --from=builder /app/receiver /receiver
+        EXPOSE 8081
+        ENTRYPOINT ["/receiver"]
+    ports:
+      - "8081:8081"
+    networks:
+      - app-network
+
+  # Simple echo-back backend (unchanged)
+  backend:
+    image: python:3.9-slim
+    ports:
+      - "8082:8082"
+    command: |
+      python -c "import http.server
+      import http.server
+      import socketserver
+
+      class BackendHandler(http.server.BaseHTTPRequestHandler):
+          def do_POST(self):
+              content_length = int(self.headers.get('Content-Length', 0))
+              data = self.rfile.read(content_length)
+              print("data", data)
+              self.send_response(200)
+              self.send_header('Content-Type', 'text/plain')
+              self.end_headers()
+              self.wfile.write(b'Received decompressed data: ' + data)
+
+      # Start the server
+      PORT = 8082
+      with socketserver.TCPServer(('', PORT), BackendHandler) as httpd:
+          print('Backend started at port', PORT)
+          httpd.serve_forever()
+      "
+    networks:
+      - app-network
+
+networks:
+  app-network:

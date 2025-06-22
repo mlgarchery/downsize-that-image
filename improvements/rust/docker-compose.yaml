@@ -1,0 +1,146 @@
+services:
+  receiver:
+    build:
+      dockerfile_inline: |
+        ##### ─── Build stage ──────────────────────────────────────────────
+        FROM rust:1.77-alpine AS builder
+        # Only the musl headers are needed; no extra busybox, no shell after this
+        RUN apk add --no-cache musl-dev
+
+        WORKDIR /app
+
+        # --- Cargo manifest (only what we need) --------------------------
+        RUN mkdir -p src
+        RUN cat <<'EOF' > Cargo.toml
+        [package]
+        name = "receiver"
+        version = "0.1.0"
+        edition = "2021"
+
+        [dependencies]
+        axum   = { version = "0.7.2", default-features = false, features = ["http1"] }
+        hyper  = { version = "1", default-features = false, features = ["client"] }
+        tokio  = { version = "1", features = ["rt-multi-thread","macros"] }
+        bytes  = "1"
+        flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+        EOF
+
+        # --- Minimal Axum handler ---------------------------------------
+        RUN cat <<'EOF' > src/main.rs
+        use axum::{
+            body::Body,
+            http::{Request, StatusCode},
+            response::IntoResponse,
+            routing::post,
+            Router,
+        };
+        use bytes::Bytes;
+        use flate2::read::GzDecoder;
+        use hyper::{Client, Uri};
+        use std::io::Read;
+        use std::net::SocketAddr;
+
+        async fn handler(req: Request<Body>) -> impl IntoResponse {
+            if req.method() != hyper::Method::POST {
+                return StatusCode::METHOD_NOT_ALLOWED;
+            }
+
+            let (parts, body) = req.into_parts();
+            let raw = match hyper::body::to_bytes(body).await {
+                Ok(b) => b,
+                Err(_) => return StatusCode::BAD_REQUEST,
+            };
+
+            // Gunzip when requested
+            let data: Bytes = if parts
+                .headers
+                .get("content-encoding")
+                .map_or(false, |v| v == "gzip")
+            {
+                let mut dec = GzDecoder::new(&raw[..]);
+                let mut buf = Vec::new();
+                if dec.read_to_end(&mut buf).is_err() {
+                    return StatusCode::BAD_REQUEST;
+                }
+                buf.into()
+            } else {
+                raw
+            };
+
+            // Forward to backend
+            let client = Client::new();
+            let uri: Uri = "http://backend:8080/".parse().unwrap();
+            match client
+                .request(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", "application/octet-stream")
+                        .body(Body::from(data))
+                        .unwrap(),
+                )
+                .await
+            {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let body_bytes =
+                        hyper::body::to_bytes(resp.into_body()).await.unwrap_or_default();
+                    (status, body_bytes).into_response()
+                }
+                Err(_) => StatusCode::BAD_GATEWAY.into_response(),
+            }
+        }
+
+        #[tokio::main]
+        async fn main() {
+            let app = Router::new().route("/", post(handler));
+            let addr = SocketAddr::from(([0, 0, 0, 0], 8081));
+            println!("receiver listening on {}", addr);
+            axum::Server::bind(&addr)
+                .serve(app.into_make_service())
+                .await
+                .unwrap();
+        }
+        EOF
+
+        # --- Release build: static, stripped -----------------------------
+        RUN cargo build --release --target x86_64-unknown-linux-musl
+
+        ##### ─── Final stage (scratch) ────────────────────────────────────
+        FROM scratch
+        COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/receiver /receiver
+        EXPOSE 8081
+        ENTRYPOINT ["/receiver"]
+    ports:
+      - "8081:8081"
+    networks:
+      - app-network
+
+  backend:
+    image: python:3.9-slim
+    ports:
+      - "8080:8080"
+    command: |
+      python3 - <<'PY'
+      import http.server, socketserver, sys
+
+      class BackendHandler(http.server.BaseHTTPRequestHandler):
+          def do_POST(self):
+              length = int(self.headers.get('Content-Length', 0))
+              data   = self.rfile.read(length)
+              self.send_response(200)
+              self.send_header('Content-Type', 'text/plain')
+              self.end_headers()
+              self.wfile.write(b'Received decompressed data: ' + data)
+          # Silence default logging
+          def log_message(self, *_): pass
+
+      with socketserver.TCPServer(('', 8080), BackendHandler) as httpd:
+          print('Backend started on 8080', file=sys.stderr)
+          httpd.serve_forever()
+      PY
+    networks:
+      - app-network
+
+networks:
+  app-network:
