@@ -10,3 +10,4 @@ The current docker image is 200MB big!
 **Your task is to downsize the image size (while still keeping it functional).**
 
 Also, keep everything inline if possible so the solution can be run and shared easily.
+
